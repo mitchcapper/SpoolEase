@@ -15,6 +15,7 @@ import {
     SpoolScaleState,
     UiSpoolRecordDisplay,
     UiSpoolMatch,
+    UiStockMatch,
     UiTagDiff,
     NewScannedTagType,
 } from "app.slint";
@@ -23,16 +24,30 @@ import { ScaleWeightDisplay, WeightDisplayContent } from "app-widgets.slint";
 import { SpoolDisplay, SpoolDisplayMode } from "spool-display.slint";
 import { UpdateWeightPage } from "common-operations.slint";
 
-enum DefinitionTagChoice { AddNew, LinkExisting }
+enum DefinitionTagChoice { AddNew, LinkExisting, AddFromStock }
 
 // One question: the default is highlighted so Next alone accepts it (next-next-next through
 // the common path), and tapping either option acts immediately without a second press.
 export component DefinitionTagScannedPage inherits Rectangle {
     background: white;
     property <DefinitionTagChoice> choice: DefinitionTagChoice.AddNew;
-
+    // The stock option only exists when this filament is actually in stock, so the page is two
+    // buttons tall most of the time and only tightens up when the third one appears.
+    property <bool> has-stock: AppState.new-tag-scan-stock-match-count > 0;
+    property <length> option-height: has-stock ? 48px : 56px;
     function go(picked: DefinitionTagChoice) {
         choice = picked;
+        if picked == DefinitionTagChoice.AddFromStock {
+            // A single stock needs no choosing - take it and go straight to the import questions.
+            if AppState.new-tag-scan-stock-match-count == 1 {
+                AppState.new-tag-scan-deduct-stock-id = AppState.new-tag-scan-stock-matches[0].id;
+                AppState.new-tag-scan-page = NewTagScanPage.SpoolTypeSelect;
+            } else {
+                AppState.new-tag-scan-page = NewTagScanPage.StockPicker;
+            }
+            return;
+        }
+        AppState.new-tag-scan-deduct-stock-id = "";
         AppState.new-tag-scan-page = picked == DefinitionTagChoice.AddNew
             ? NewTagScanPage.SpoolTypeSelect
             : NewTagScanPage.SpoolPicker;
@@ -45,8 +60,8 @@ export component DefinitionTagScannedPage inherits Rectangle {
         VerticalLayout {
             alignment: start;
             padding: 5px;
-            padding-top: 10px;
-            spacing: 8px;
+            padding-top: has-stock ? 4px : 10px;
+            spacing: has-stock ? 6px : 8px;
             MyText {
                 wrap: word-wrap;
                 text: "This tag isn't in your inventory.";
@@ -56,7 +71,7 @@ export component DefinitionTagScannedPage inherits Rectangle {
             MyButton {
                 type: ButtonType.RadioButton;
                 pushed: choice == DefinitionTagChoice.AddNew;
-                height: 56px;
+                height: option-height;
                 text: "Add as New Spool";
                 pressed => { go(DefinitionTagChoice.AddNew); }
             }
@@ -64,16 +79,77 @@ export component DefinitionTagScannedPage inherits Rectangle {
             MyButton {
                 type: ButtonType.RadioButton;
                 pushed: choice == DefinitionTagChoice.LinkExisting;
-                height: 56px;
+                height: option-height;
                 text: "Link Tag to Existing Spool" + (AppState.new-tag-scan-product-match-count > 0 ? " (\{AppState.new-tag-scan-product-match-count} matching)" : "");
                 pressed => { go(DefinitionTagChoice.LinkExisting); }
             }
+
+            if has-stock: MyButton {
+                type: ButtonType.RadioButton;
+                pushed: choice == DefinitionTagChoice.AddFromStock;
+                height: option-height;
+                text: "Add and Remove From Stock" + (AppState.new-tag-scan-stock-match-count > 1 ? " (\{AppState.new-tag-scan-stock-match-count})" : "");
+                pressed => { go(DefinitionTagChoice.AddFromStock); }
+            }
         }
+
         WizardButtons {
             back-enabled: false;
             next-enabled: true;
             cancel-text: "⌂ Home";
             next-clicked => { go(choice); }
+            cancel-clicked => { AppState.control-state = ControlState.Ready; }
+        }
+    }
+}
+
+// Only reached when more than one stock holds this filament - a single match is taken without
+// asking. The rows are capped by rust, so the note says how many were left out.
+export component StockPickerPage inherits Rectangle {
+    background: white;
+    property <int> overflow-count: AppState.new-tag-scan-stock-match-count - AppState.new-tag-scan-stock-matches.length;
+
+    VerticalLayout {
+        Title {
+            text: "Remove a Spool From Which Stock?";
+        }
+        VerticalLayout {
+            alignment: start;
+            padding: 4px;
+            spacing: 3px;
+            MyText {
+                height: 32px;
+                wrap: word-wrap;
+                text: overflow-count > 0
+                    ? "Matching stocks  +\{overflow-count} more"
+                    : "Matching stocks:";
+            }
+
+            for entry in AppState.new-tag-scan-stock-matches: MyButton {
+                type: ButtonType.RadioButton;
+                pushed: AppState.new-tag-scan-deduct-stock-id == entry.id;
+                height: 40px;
+                horizontal-alignment: left;
+                text-padding: 6px;
+                wrap: no-wrap;
+                overflow: elide;
+                text: "\{entry.line1}  (\{entry.count})";
+                pressed => {
+                    AppState.new-tag-scan-deduct-stock-id = entry.id;
+                }
+            }
+        }
+
+        WizardButtons {
+            back-enabled: true;
+            next-enabled: AppState.new-tag-scan-deduct-stock-id != "";
+            next-text: "Next ▶";
+            cancel-text: "⌂ Home";
+            next-clicked => { AppState.new-tag-scan-page = NewTagScanPage.SpoolTypeSelect; }
+            back-clicked => {
+                AppState.new-tag-scan-deduct-stock-id = "";
+                AppState.new-tag-scan-page = NewTagScanPage.DefinitionTagScanned;
+            }
             cancel-clicked => { AppState.control-state = ControlState.Ready; }
         }
     }
@@ -114,7 +190,8 @@ export component SpoolTypePage inherits Rectangle {
                 AppState.new-tag-scan-definition-type,
                 AppState.new-tag-scan-definition-info,
                 AppState.new-tag-scan-empty-spool-weight,
-                AppState.new-tag-scan-spool-is-full
+                AppState.new-tag-scan-spool-is-full,
+                AppState.new-tag-scan-deduct-stock-id
             );
         }
     }
@@ -190,7 +267,15 @@ export component SpoolTypePage inherits Rectangle {
             next-clicked => {
                 submit();
             }
-            back-clicked => { AppState.new-tag-scan-page = NewTagScanPage.DefinitionTagScanned; }
+            // Back returns to wherever the stock was chosen, so the choice can be changed.
+            back-clicked => {
+                if AppState.new-tag-scan-stock-match-count > 1 && AppState.new-tag-scan-deduct-stock-id != "" {
+                    AppState.new-tag-scan-page = NewTagScanPage.StockPicker;
+                } else {
+                    AppState.new-tag-scan-deduct-stock-id = "";
+                    AppState.new-tag-scan-page = NewTagScanPage.DefinitionTagScanned;
+                }
+            }
             cancel-clicked => { AppState.control-state = ControlState.Ready; }
         }
     }
@@ -655,6 +740,7 @@ export component NewTagScan inherits Rectangle {
     if AppState.new-tag-scan-page == NewTagScanPage.DefinitionTagScanned: DefinitionTagScannedPage { }
     if AppState.new-tag-scan-page == NewTagScanPage.SpoolTypeSelect: SpoolTypePage { }
     if AppState.new-tag-scan-page == NewTagScanPage.SpoolPicker: SpoolPickerPage { }
+    if AppState.new-tag-scan-page == NewTagScanPage.StockPicker: StockPickerPage { }
     if AppState.new-tag-scan-page == NewTagScanPage.SpoolSelect: SpoolSelectStep { }
     if AppState.new-tag-scan-page == NewTagScanPage.SpoolDisplay: SpoolDisplayStep { spool-display: root.spool-display; }
     if AppState.new-tag-scan-page == NewTagScanPage.ConfirmTagMismatch: ConfirmTagMismatchPage { }

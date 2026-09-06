@@ -109,6 +109,13 @@ export struct UiSpoolMatch {
     blocked-reason: string,
 }
 
+// A stock record offered as holding the same filament as some spool or tag.
+export struct UiStockMatch {
+    id: string,
+    line1: string,
+    count: int,
+}
+
 export struct UiSlotDisplay {
   filament-title: string,
   slicer-name: string,
@@ -199,9 +206,12 @@ export global AppBackend {
     callback calibrate-scale(source: SpoolScaleSource, weight: int);
     pure callback get-connected-scale-info() -> string;
     pure callback get-available-scales-info() -> [string];
-    callback import-definition-tag-to-inventory(tag-id: string, tag-definition-type: string, tag-definition-info: string, empty-spool-weight: int, spool-is-full: bool);
+    // `deduct-stock-id` is the stock record a spool is being taken out of ("Add and Remove From
+    // Stock"); empty means the import doesn't touch any stock.
+    callback import-definition-tag-to-inventory(tag-id: string, tag-definition-type: string, tag-definition-info: string, empty-spool-weight: int, spool-is-full: bool, deduct-stock-id: string);
     // Undo of the above: deletes the record it created, frees its auto-linked tag, clears staging.
-    callback discard-imported-spool(spool-id: string);
+    // `restore-stock-id` puts back the spool the import took out of that stock; "" if it took none.
+    callback discard-imported-spool(spool-id: string, restore-stock-id: string);
     callback link-tag-to-untagged-spool-id(tag_id: string, tag_type: string, spool-id: string, final-step: bool);
     callback link-tag-to-tagged-spool-id(tag_id: string, tag_type: string, spool-id: string, final-step: bool);
     callback unlink-spool-from-all-tags(spool-id: string);
@@ -238,6 +248,16 @@ export global AppBackend {
     pure callback location-str-to-location(location-str: string) -> Location;
     callback load-staging(spool-id: string) -> string; // returns error if not found
     callback ensure-circle-checkerboard(diameter: int, offset-x: int, offset-y: int);
+    // Stock records holding the same filament as a spool. `revision` is AppState.stocks-revision -
+    // it is not read by rust, it is there so the bindings re-evaluate after a stock is changed.
+    pure callback matching-stock-count(spool-id: string, revision: int) -> int;
+    pure callback get-matching-stocks(spool-id: string, revision: int) -> [UiStockMatch];
+    // Copies the spool's filament details into a new stock record holding 1 spool.
+    callback create-stock-from-spool(spool-id: string);
+    // Adds `delta` to a stock record's count, clamped at 0.
+    callback adjust-stock-count(stock-id: string, delta: int);
+    // Removes a stock record entirely. Refused by rust unless the record is stock.
+    callback delete-stock(stock-id: string);
 }
 
 export enum NewScannedTagType {
@@ -249,6 +269,7 @@ export enum NewTagScanPage {
     DefinitionTagScanned,
     SpoolTypeSelect,
     SpoolPicker,
+    StockPicker,
     SpoolSelect,
     SpoolDisplay,
     ConfirmTagMismatch,
@@ -275,7 +296,9 @@ export enum StagingOperationsPage {
   ManualStoragePosition,
   ManualStorageContainer,
   ManualStorageComplete,
-  MarkEmptyConfirm
+  MarkEmptyConfirm,
+  TagOperations,
+  Stocks
 }
 
 export struct Firmwares {
@@ -347,6 +370,11 @@ export global AppState {
     in-out property <[UiSpoolMatch]> new-tag-scan-candidates: [];
     in-out property <int> new-tag-scan-product-match-count: 0; // full match total, for the "(N matching)" label
     in-out property <int> new-tag-scan-match-overflow: 0; // matches dropped by the row cap, for the "+N more" note
+    // Stock records holding this same filament, offered as "Add and Remove From Stock".
+    in-out property <[UiStockMatch]> new-tag-scan-stock-matches: [];
+    in-out property <int> new-tag-scan-stock-match-count: 0; // full total, before the row cap
+    // The stock the new spool is being taken out of. "" means the import touches no stock.
+    in-out property <string> new-tag-scan-deduct-stock-id: "";
     in-out property <string> new-tag-scan-selected-spool-id: "";
     in-out property <bool> new-tag-scan-select-enter-id: false;
     in-out property <string> new-tag-scan-last-result: "";
@@ -379,6 +407,9 @@ export global AppState {
         self.new-tag-scan-candidates = [];
         self.new-tag-scan-product-match-count = 0;
         self.new-tag-scan-match-overflow = 0;
+        self.new-tag-scan-stock-matches = [];
+        self.new-tag-scan-stock-match-count = 0;
+        self.new-tag-scan-deduct-stock-id = "";
         self.new-tag-scan-selected-spool-id = "";
         self.new-tag-scan-select-enter-id = false;
         self.new-tag-scan-last-result = "";
@@ -461,6 +492,8 @@ export global AppState {
 
     in-out property <StagingOperationsPage> staging-operation-page: StagingOperationsPage.OperationSelection;
     in-out property <StagingOperationsPage> prev-staging-operation-page: StagingOperationsPage.OperationSelection;
+    // Bumped by rust after any stock record changes, so the stock bindings re-query the store.
+    in-out property <int> stocks-revision: 0;
     in-out property <int> manual-storage-rack-id: 0;
     in-out property <string> manual-storage-rack-name: "";
     in-out property <int> manual-storage-bay: 0;
@@ -1203,6 +1236,7 @@ export global AppState {
     public function new-definition-tag-scanned(
         definition-type: string, tag-id: string, definition-info: string,
         candidates: [UiSpoolMatch], product-match-count: int, match-overflow: int,
+        stock-matches: [UiStockMatch], stock-match-count: int,
     ) {
         self.reset-new-tag-scan-state();
         self.new-tag-scan-tag-id = tag-id;
@@ -1212,6 +1246,8 @@ export global AppState {
         self.new-tag-scan-candidates = candidates;
         self.new-tag-scan-product-match-count = product-match-count;
         self.new-tag-scan-match-overflow = match-overflow;
+        self.new-tag-scan-stock-matches = stock-matches;
+        self.new-tag-scan-stock-match-count = stock-match-count;
         self.new-tag-scan-page = NewTagScanPage.DefinitionTagScanned;
         self.control-state = ControlState.NewTagScan;
     }
@@ -1239,7 +1275,7 @@ export global AppState {
     // Back out of the pages that follow the import. Called by the page; Rust answers here.
     public function request-discard-imported-spool() {
         self.new-tag-scan-discarding = true;
-        AppBackend.discard-imported-spool(self.new-tag-scan-spool-id);
+        AppBackend.discard-imported-spool(self.new-tag-scan-spool-id, self.new-tag-scan-deduct-stock-id);
     }
 
     public function discard-imported-spool-status(status: string) {

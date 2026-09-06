@@ -313,6 +313,10 @@ enum StorageRackValue {
 /// See UPDATED_SCAN_PLAN.md §3 - raising this overflows the picker page.
 const MAX_SPOOL_CANDIDATES: usize = 3;
 
+/// Max stock rows any of the stock pages can show. Both the new-tag-scan picker and the staging
+/// stocks page are laid out for three; anything past that is reported as "+N more".
+const MAX_STOCK_MATCHES: usize = 3;
+
 /// Rows for the SpoolPicker page plus the two counts the UI needs to label itself.
 struct LinkCandidates {
     rows: slint::ModelRc<crate::app::UiSpoolMatch>,
@@ -320,6 +324,10 @@ struct LinkCandidates {
     product_match_count: i32,
     /// Product matches dropped by the cap - drives the "+N more" note.
     match_overflow: i32,
+    /// Stock records holding this same filament, newest first, capped at `MAX_STOCK_MATCHES`.
+    stock_rows: slint::ModelRc<crate::app::UiStockMatch>,
+    /// Full stock-match total, before the cap.
+    stock_match_count: i32,
 }
 
 /// Why a spool is being offered, in the order the picker should prefer them.
@@ -1227,21 +1235,43 @@ impl ViewModel {
             moved_view_model.borrow().ui_tag_spool_differences(ty.as_str(), info.as_str(), spool_id.as_str())
         });
         let moved_view_model = self.view_model.clone().unwrap();
-        ui_app_backend.on_import_definition_tag_to_inventory(move |tag_id, tag_definition_type, tag_definition_info, empty_spool_weight, spool_is_full| {
-            moved_view_model.borrow().ui_import_definition_tag_to_inventory(
-                tag_id.as_str(),
-                tag_definition_type.as_str(),
-                tag_definition_info.as_str(),
-                empty_spool_weight,
-                spool_is_full,
-            )
-        });
+        ui_app_backend.on_import_definition_tag_to_inventory(
+            move |tag_id, tag_definition_type, tag_definition_info, empty_spool_weight, spool_is_full, deduct_stock_id| {
+                moved_view_model.borrow().ui_import_definition_tag_to_inventory(
+                    tag_id.as_str(),
+                    tag_definition_type.as_str(),
+                    tag_definition_info.as_str(),
+                    empty_spool_weight,
+                    spool_is_full,
+                    deduct_stock_id.as_str(),
+                )
+            },
+        );
 
         let moved_view_model = self.view_model.clone().unwrap();
-        ui_app_backend.on_discard_imported_spool(move |spool_id| {
+        // `revision` only exists to make the slint binding re-evaluate after a stock changes.
+        ui_app_backend.on_matching_stock_count(move |spool_id, _revision| moved_view_model.borrow().ui_matching_stock_count(spool_id.as_str()));
+
+        let moved_view_model = self.view_model.clone().unwrap();
+        ui_app_backend.on_get_matching_stocks(move |spool_id, _revision| moved_view_model.borrow().ui_get_matching_stocks(spool_id.as_str()));
+
+        let moved_view_model = self.view_model.clone().unwrap();
+        ui_app_backend.on_create_stock_from_spool(move |spool_id| moved_view_model.borrow().ui_create_stock_from_spool(spool_id.as_str()));
+
+        let moved_view_model = self.view_model.clone().unwrap();
+        ui_app_backend.on_adjust_stock_count(move |stock_id, delta| moved_view_model.borrow().ui_adjust_stock_count(stock_id.as_str(), delta));
+
+        let moved_view_model = self.view_model.clone().unwrap();
+        ui_app_backend.on_delete_stock(move |stock_id| moved_view_model.borrow().ui_delete_stock(stock_id.as_str()));
+
+        let moved_view_model = self.view_model.clone().unwrap();
+        ui_app_backend.on_discard_imported_spool(move |spool_id, restore_stock_id| {
             let _ = moved_view_model
                 .borrow()
-                .dispatch_async_task(AppAsyncTaskRequest::DiscardImportedSpool { spool_id: spool_id.into() });
+                .dispatch_async_task(AppAsyncTaskRequest::DiscardImportedSpool {
+                    spool_id: spool_id.into(),
+                    restore_stock_id: restore_stock_id.into(),
+                });
         });
 
         let moved_view_model = self.view_model.as_ref().unwrap().clone();
@@ -2162,6 +2192,7 @@ impl ViewModel {
         tag_definition_info: &str,
         empty_spool_weight: i32,
         spool_is_full: bool,
+        deduct_stock_id: &str,
     ) {
         let _ = self.dispatch_async_task(AppAsyncTaskRequest::ImportDefinitionTagToInventory {
             tag_id: tag_id.to_string(),
@@ -2169,6 +2200,26 @@ impl ViewModel {
             tag_definition_info: tag_definition_info.to_string(),
             empty_spool_weight,
             spool_is_full,
+            deduct_stock_id: deduct_stock_id.to_string(),
+        });
+    }
+
+    fn ui_create_stock_from_spool(&self, spool_id: &str) {
+        let _ = self.dispatch_async_task(AppAsyncTaskRequest::CreateStockFromSpool {
+            spool_id: spool_id.to_string(),
+        });
+    }
+
+    fn ui_adjust_stock_count(&self, stock_id: &str, delta: i32) {
+        let _ = self.dispatch_async_task(AppAsyncTaskRequest::AdjustStockCount {
+            stock_id: stock_id.to_string(),
+            delta,
+        });
+    }
+
+    fn ui_delete_stock(&self, stock_id: &str) {
+        let _ = self.dispatch_async_task(AppAsyncTaskRequest::DeleteStock {
+            stock_id: stock_id.to_string(),
         });
     }
 
@@ -2616,8 +2667,16 @@ impl ViewModel {
         // cap, not before - a SpoolRecord is a dozen heap allocations and only 3 survive.
         let mut product_match_count = 0;
         let mut picks: Vec<(CandidateReason, i32, String, SharedString)> = Vec::new();
+        // Stock records are never link targets, but a stock holding this same filament is what
+        // the "Add and Remove From Stock" option spends, so collect them in the same pass.
+        let mut stock_match_count = 0;
+        let mut stock_picks: Vec<(i32, String)> = Vec::new();
         if let Some(spools_db) = self.store.spools_db.get() {
             for rec in spools_db.records.borrow().values().map(|rec| &rec.data) {
+                if rec.spools_count > 2 && rec.spools_count > 0 && Self::stock_holds_same_product(candidate, &candidate_colors, rec) { //once stocks to zero is merged in the first condition here should be rec.is_stock()  the > 0 should remaing even after
+                    stock_match_count += 1;
+                    stock_picks.push((rec.added_time.unwrap_or(i32::MIN), rec.id.clone()));
+                }
                 let is_match = rec.spools_count <= 1
                     && match (candidate, &candidate_colors) {
                         (Some(tag), Some(colors)) => Self::spools_are_same_product(tag, colors, rec),
@@ -2669,11 +2728,85 @@ impl ViewModel {
                 Some(self.spool_match_row(&rec, reason.label(), blocked))
             })
             .collect();
+        // Newest stock first, same as the spool rows.
+        stock_picks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        stock_picks.truncate(MAX_STOCK_MATCHES);
+        let stock_out: Vec<crate::app::UiStockMatch> = stock_picks
+            .into_iter()
+            .filter_map(|(_, id)| Some(Self::stock_match_row(&self.store.get_spool_by_id(&id)?)))
+            .collect();
         LinkCandidates {
             rows: slint::ModelRc::new(slint::VecModel::from(out)),
             product_match_count,
             match_overflow: product_match_count - shown_match_count,
+            stock_rows: slint::ModelRc::new(slint::VecModel::from(stock_out)),
+            stock_match_count,
         }
+    }
+
+    /// A stock record holds the same product as `candidate` when their filament details agree.
+    /// Without a candidate (a blank or unparsable tag) nothing matches.
+    fn stock_holds_same_product(candidate: Option<&SpoolRecord>, candidate_colors: &Option<Vec<String>>, stock: &SpoolRecord) -> bool {
+        match (candidate, candidate_colors) {
+            (Some(reference), Some(colors)) => Self::spools_are_same_product(reference, colors, stock),
+            _ => false,
+        }
+    }
+
+    fn stock_match_row(rec: &SpoolRecord) -> crate::app::UiStockMatch {
+        let subtype = if rec.material_subtype.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", rec.material_subtype)
+        };
+        crate::app::UiStockMatch {
+            id: rec.id.to_shared_string(),
+            line1: slint::format!(
+                "#{} {} {}{} {}",
+                rec.id, rec.brand, rec.material_type, subtype,
+                Self::usable_color_name(rec).unwrap_or("")
+            ),
+            count: rec.spools_count,
+        }
+    }
+
+    /// Stock records holding the same filament as `spool_id`, newest first, capped for the page.
+    /// The spool itself is excluded - a record is never its own stock. Empty stocks are kept: the
+    /// staging page is where the count is raised again.
+    fn matching_stocks(&self, spool_id: &str) -> (Vec<crate::app::UiStockMatch>, i32) {
+        let Some(reference) = self.store.get_spool_by_id(spool_id) else {
+            return (Vec::new(), 0);
+        };
+        let reference_colors = Self::normalized_color_set(&reference.color_code);
+        let mut total = 0;
+        let mut picks: Vec<(i32, String)> = Vec::new();
+        if let Some(spools_db) = self.store.spools_db.get() {
+            for rec in spools_db.records.borrow().values().map(|rec| &rec.data) {
+                if rec.id == reference.id || !rec.is_stock() {
+                    continue;
+                }
+                if !Self::spools_are_same_product(&reference, &reference_colors, rec) {
+                    continue;
+                }
+                total += 1;
+                picks.push((rec.added_time.unwrap_or(i32::MIN), rec.id.clone()));
+            }
+        }
+        picks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        picks.truncate(MAX_STOCK_MATCHES);
+        let rows = picks
+            .into_iter()
+            .filter_map(|(_, id)| Some(Self::stock_match_row(&self.store.get_spool_by_id(&id)?)))
+            .collect();
+        (rows, total)
+    }
+
+    fn ui_matching_stock_count(&self, spool_id: &str) -> i32 {
+        self.matching_stocks(spool_id).1
+    }
+
+    fn ui_get_matching_stocks(&self, spool_id: &str) -> slint::ModelRc<crate::app::UiStockMatch> {
+        slint::ModelRc::new(slint::VecModel::from(self.matching_stocks(spool_id).0))
     }
 
     fn spool_match_row(&self, rec: &SpoolRecord, reason: &str, blocked: SharedString) -> crate::app::UiSpoolMatch {
@@ -2950,6 +3083,7 @@ impl ViewModel {
         tag_definition_info: String,
         empty_spool_weight: i32,
         spool_is_full: bool,
+        deduct_stock_id: String,
     ) {
         let (spool_rec, origin_data) = match tag_definition_type.as_str() {
             BAMBULAB_TAG_TYPE => {
@@ -3007,6 +3141,11 @@ impl ViewModel {
                         vm.filament_staging.borrow_mut().set_scanned_tag_id(Some(tag_id.clone()));
                         vm.display_filament_staging(false);
                     }
+                    // The spool came off the shelf, so the stock it came from is one lighter.
+                    if !deduct_stock_id.is_empty() {
+                        Self::apply_stock_delta(&store, &deduct_stock_id, -1).await;
+                        Self::bump_stocks_revision(&view_model);
+                    }
                     Self::set_staging_rec_ext_async(view_model.clone()).await;
                     ui_app_state.invoke_import_definition_tag_to_inventory_status("".into(), new_spool_rec_id.into());
                 }
@@ -3024,12 +3163,153 @@ impl ViewModel {
         }
     }
 
+    /// Adds `delta` to a stock record's count, clamped at 0. Returns the count it ended up at,
+    /// or `None` when the record is missing, isn't stock, or the write failed.
+    async fn apply_stock_delta(store: &Rc<Store>, stock_id: &str, delta: i32) -> Option<i32> {
+        let mut stock_rec = store.get_spool_by_id(stock_id)?;
+        if !stock_rec.is_stock() {
+            error!("Refusing to change the count of {stock_id}: it isn't a stock record");
+            return None;
+        }
+        let new_count = (stock_rec.spools_count + delta).max(0);
+        if new_count == stock_rec.spools_count {
+            return Some(new_count);
+        }
+        stock_rec.spools_count = new_count;
+        // Legacy records identified stock by count alone, so stamp the flag before it can drop to 1.
+        stock_rec.stock = Some(true);
+        match store.update_spool(stock_rec, None).await {
+            Ok(_) => Some(new_count),
+            Err(err) => {
+                error!("Failed to update stock {stock_id} count : {err:?}");
+                None
+            }
+        }
+    }
+
+    /// Tells the stock bindings in the UI that the store changed under them.
+    fn bump_stocks_revision(view_model: &Rc<RefCell<ViewModel>>) {
+        let ui = view_model.borrow().ui_weak.unwrap();
+        let ui_app_state = ui.global::<crate::app::AppState>();
+        ui_app_state.set_stocks_revision(ui_app_state.get_stocks_revision() + 1);
+    }
+
+    async fn adjust_stock_count_async(view_model: Rc<RefCell<ViewModel>>, stock_id: String, delta: i32) {
+        let store = view_model.borrow().store.clone();
+        match Self::apply_stock_delta(&store, &stock_id, delta).await {
+            Some(new_count) => {
+                info!("Stock {stock_id} now holds {new_count} spools");
+                Self::bump_stocks_revision(&view_model);
+            }
+            None => view_model.borrow().message_box(
+                "Stock Notice",
+                "Failed to change the stock count",
+                "",
+                crate::app::StatusType::Error,
+                -1,
+            ),
+        }
+    }
+
+    async fn delete_stock_async(view_model: Rc<RefCell<ViewModel>>, stock_id: String) {
+        let store = view_model.borrow().store.clone();
+        if !store.get_spool_by_id(&stock_id).is_some_and(|rec| rec.is_stock()) {
+            error!("Refusing to delete {stock_id}: it isn't a stock record");
+            return;
+        }
+        match store.delete_spool(&stock_id).await {
+            Ok(()) => {
+                info!("Deleted stock record {stock_id}");
+                Self::bump_stocks_revision(&view_model);
+            }
+            Err(err) => {
+                error!("Failed to delete stock {stock_id} : {err:?}");
+                view_model.borrow().message_box(
+                    "Stock Notice",
+                    "Failed to delete the stock record",
+                    &err.to_string(),
+                    crate::app::StatusType::Error,
+                    -1,
+                );
+            }
+        }
+    }
+
+    /// Copies the staged spool's filament details into a new stock record holding one spool.
+    /// The stock starts out full at the label weight (falling back to the spool's new-spool weight
+    /// when there is no label weight), and carries no tag and no actual location of its own.
+    async fn create_stock_from_spool_async(view_model: Rc<RefCell<ViewModel>>, spool_id: String) {
+        let store = view_model.borrow().store.clone();
+        let Some(spool_rec) = store.get_spool_by_id(&spool_id) else {
+            view_model.borrow().message_box(
+                "Stock Notice",
+                &format!("Spool {spool_id} not Found"),
+                "",
+                crate::app::StatusType::Error,
+                -1,
+            );
+            return;
+        };
+        // Weights are gross (filament + core), so the label weight needs the core added back on.
+        let full_weight = match spool_rec.weight_advertised.filter(|label| *label > 0) {
+            Some(label_weight) => {
+                let core_weight = spool_rec
+                    .weight_core
+                    .or_else(|| spool_rec.weight_new.map(|weight_new| weight_new - label_weight))
+                    .unwrap_or(0);
+                Some(label_weight + core_weight)
+            }
+            None => spool_rec.weight_new,
+        };
+        let stock_rec = SpoolRecord {
+            id: String::new(),
+            tag_id: Vec::new(),
+            weight_new: full_weight,
+            weight_current: full_weight,
+            consumed_since_add: 0.0,
+            consumed_since_weight: 0.0,
+            added_time: None,
+            encode_time: None,
+            added_full: Some(true),
+            ext_has_k: false,
+            data_origin: String::new(),
+            tag_type: String::new(),
+            actual_location: String::new(),
+            spools_count: 1,
+            stock: Some(true),
+            ..spool_rec
+        };
+        match store.add_spool(stock_rec, SpoolRecordExt::default()).await {
+            Ok(new_stock_id) => {
+                info!("Created stock record {new_stock_id} from spool {spool_id}");
+                Self::bump_stocks_revision(&view_model);
+                view_model.borrow().message_box(
+                    "Stock Notice",
+                    &format!("Created stock #{new_stock_id} from spool #{spool_id}"),
+                    "",
+                    crate::app::StatusType::Success,
+                    -1,
+                );
+            }
+            Err(err) => {
+                error!("Failed to create stock from spool {spool_id} : {err:?}");
+                view_model.borrow().message_box(
+                    "Critical Store Notice",
+                    "Failed to create the stock record",
+                    &err.to_string(),
+                    crate::app::StatusType::Error,
+                    -1,
+                );
+            }
+        }
+    }
+
 
 
     /// Undo of `import_definition_tag_to_inventory_async`: Back on the pages that follow the
     /// import must leave no trace of the record it created. `delete_spool` also drops the
     /// tag-id index entries and the ext file, so the auto-linked tag becomes free again.
-    async fn discard_imported_spool_async(view_model: Rc<RefCell<ViewModel>>, spool_id: String) {
+    async fn discard_imported_spool_async(view_model: Rc<RefCell<ViewModel>>, spool_id: String, restore_stock_id: String) {
         let store = view_model.borrow().store.clone();
         let ui = view_model.borrow().ui_weak.unwrap();
         let ui_app_state = ui.global::<crate::app::AppState>();
@@ -3042,6 +3322,11 @@ impl ViewModel {
                         vm.recently_added_spool_id = None;
                     }
                     vm.filament_staging.borrow_mut().clear();
+                }
+                // The spool is gone, so the stock it was taken out of gets it back.
+                if !restore_stock_id.is_empty() {
+                    Self::apply_stock_delta(&store, &restore_stock_id, 1).await;
+                    Self::bump_stocks_revision(&view_model);
                 }
                 ui_app_state.invoke_empty_spool_staging();
                 ui_app_state.invoke_discard_imported_spool_status(SharedString::new());
@@ -4224,6 +4509,8 @@ impl SpoolTagObserver for ViewModel {
                             candidates.rows,
                             candidates.product_match_count,
                             candidates.match_overflow,
+                            candidates.stock_rows,
+                            candidates.stock_match_count,
                         );
                     } else {
                         // Unknown format, treat as an empty tag
@@ -4256,6 +4543,8 @@ impl SpoolTagObserver for ViewModel {
                             candidates.rows,
                             candidates.product_match_count,
                             candidates.match_overflow,
+                            candidates.stock_rows,
+                            candidates.stock_match_count,
                         );
                     }
                 }
@@ -5097,6 +5386,7 @@ enum AppAsyncTaskRequest {
     },
     DiscardImportedSpool {
         spool_id: String,
+        restore_stock_id: String,
     },
     SetStagingRecExt {},
     SetSpoolWeight {
@@ -5127,6 +5417,18 @@ enum AppAsyncTaskRequest {
         tag_definition_info: String,
         empty_spool_weight: i32,
         spool_is_full: bool,
+        /// Stock to take the imported spool out of. Empty leaves every stock alone.
+        deduct_stock_id: String,
+    },
+    CreateStockFromSpool {
+        spool_id: String,
+    },
+    AdjustStockCount {
+        stock_id: String,
+        delta: i32,
+    },
+    DeleteStock {
+        stock_id: String,
     },
 }
 
@@ -5156,7 +5458,9 @@ pub async fn app_async_task(view_model: Rc<RefCell<ViewModel>>) {
                 final_step,
             } => ViewModel::link_tag_to_spool_id_async(view_model.clone(), tag_id, tag_type, spool_id, mode, final_step).await,
             AppAsyncTaskRequest::UnLinkSpoolTags { spool_id, mode } => ViewModel::unlink_spool_tags_async(view_model.clone(), spool_id, mode).await,
-            AppAsyncTaskRequest::DiscardImportedSpool { spool_id } => ViewModel::discard_imported_spool_async(view_model.clone(), spool_id).await,
+            AppAsyncTaskRequest::DiscardImportedSpool { spool_id, restore_stock_id } => {
+                ViewModel::discard_imported_spool_async(view_model.clone(), spool_id, restore_stock_id).await
+            }
             AppAsyncTaskRequest::SetStagingRecExt { .. } => ViewModel::set_staging_rec_ext_async(view_model.clone()).await,
             AppAsyncTaskRequest::SetSpoolWeight {
                 spool_id,
@@ -5184,6 +5488,7 @@ pub async fn app_async_task(view_model: Rc<RefCell<ViewModel>>) {
                 tag_definition_info,
                 empty_spool_weight,
                 spool_is_full,
+                deduct_stock_id,
             } => {
                 ViewModel::import_definition_tag_to_inventory_async(
                     view_model.clone(),
@@ -5192,9 +5497,13 @@ pub async fn app_async_task(view_model: Rc<RefCell<ViewModel>>) {
                     tag_definition_info,
                     empty_spool_weight,
                     spool_is_full,
+                    deduct_stock_id,
                 )
                 .await
             }
+            AppAsyncTaskRequest::CreateStockFromSpool { spool_id } => ViewModel::create_stock_from_spool_async(view_model.clone(), spool_id).await,
+            AppAsyncTaskRequest::AdjustStockCount { stock_id, delta } => ViewModel::adjust_stock_count_async(view_model.clone(), stock_id, delta).await,
+            AppAsyncTaskRequest::DeleteStock { stock_id } => ViewModel::delete_stock_async(view_model.clone(), stock_id).await,
         }
     }
 }
